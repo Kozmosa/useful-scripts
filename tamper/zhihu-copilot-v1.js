@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         知乎回答内容提取（可视化选取 + 选择器输入 + 清洗 + JSON导出/剪贴板）
+// @name         知乎回答内容提取（可视化选取 + 选择器输入 + 清洗 + JSON导出/剪贴板 + 问题回退）
 // @namespace    https://github.com/Kozmosa
-// @version      0.6.1
-// @description  支持可视化点击或手动输入两种方式选取回答容器；段落清洗；可选 JSON 导出与自动复制；设置持久化；alert+console 输出
+// @version      0.6.2
+// @description  可视化点击或手动选择回答容器；问题智能获取（若局部未含问号则回退至全局 QuestionHeader）；清洗段落；可选 JSON 导出与自动复制；设置持久化；alert+console 输出
 // @author       Kozmosa
 // @match        https://www.zhihu.com/*
 // @match        https://zhihu.com/*
@@ -15,7 +15,7 @@
 (() => {
   'use strict';
 
-  /******************** 配置持久化 Keys ********************/
+  /******************** 持久化 Keys ********************/
   const KEY_EXPORT_JSON = 'ZH_EXPORT_JSON_ENABLED';
   const KEY_AUTO_COPY   = 'ZH_AUTO_COPY_ENABLED';
 
@@ -23,7 +23,7 @@
   let exportJSONEnabled = getPersist(KEY_EXPORT_JSON, false);
   let autoCopyEnabled   = getPersist(KEY_AUTO_COPY, false);
 
-  // 可视化选取模式状态
+  // 可视化选取状态
   let isPicking = false;
   let hoverOverlay = null;
   let selectOverlay = null;
@@ -32,7 +32,7 @@
   let selectedEl = null;
   let confirmPanel = null;
 
-  /******************** 初始化入口 ********************/
+  /******************** 初始化 ********************/
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', initUI);
   } else {
@@ -135,7 +135,7 @@
           复制逻辑：<br>
           ① 自动复制 + 导出 JSON => 复制 JSON 字符串<br>
           ② 仅自动复制 => 复制“问题 + 回答”纯文本<br>
-          ③ 仅导出 JSON => 下载文件，不复制
+          ③ 仅导出 JSON => 只下载文件
         </div>
       </div>
       <div style="margin-top:18px;display:flex;justify-content:flex-end;gap:10px;">
@@ -155,9 +155,7 @@
       setPersist(KEY_AUTO_COPY, autoCopyEnabled);
     });
     panel.querySelector('#__btn_close_settings__').addEventListener('click', () => mask.remove());
-    mask.addEventListener('click', e => {
-      if (e.target === mask) mask.remove();
-    });
+    mask.addEventListener('click', e => { if (e.target === mask) mask.remove(); });
   }
 
   function inlineBtnStyle(color) {
@@ -173,7 +171,7 @@
     `;
   }
 
-  /******************** 选择器提取（原逻辑） ********************/
+  /******************** 手动输入选择器 ********************/
   function manualSelectorFlow() {
     const selector = prompt('请输入回答容器的 CSS 选择器：', '');
     if (!selector || !selector.trim()) {
@@ -190,7 +188,7 @@
     processContainer(container, cleanSelector);
   }
 
-  /******************** 可视化选取流程 ********************/
+  /******************** 可视化选取 ********************/
   function startVisualPick() {
     if (isPicking) return;
     isPicking = true;
@@ -207,7 +205,6 @@
     document.addEventListener('contextmenu', onPickCancelContext, true);
   }
 
-  // 点击选中后立即退出 picking（但保留选中框与确认面板）
   function exitPickAfterSelection() {
     isPicking = false;
     removeElement(hoverOverlay);
@@ -245,9 +242,7 @@
 
   function onPickMouseMove(e) {
     if (!isPicking) return;
-    // 忽略浮层上的移动
     if (confirmPanel && confirmPanel.contains(e.target)) return;
-
     const target = e.target;
     const container = findBestContainer(target);
     currentHoverEl = container || target;
@@ -256,17 +251,12 @@
 
   function onPickClick(e) {
     if (!isPicking) return;
-    // 若点击确认面板（极端情况）直接忽略
     if (confirmPanel && confirmPanel.contains(e.target)) return;
-
     e.preventDefault();
     e.stopPropagation();
-
     if (!currentHoverEl) return;
     selectedEl = currentHoverEl;
-
     highlightElement(selectedEl, selectOverlay, 'rgba(255,120,120,0.28)', '2px solid rgba(200,40,40,0.85)');
-    // 退出 picking，防止后续 hover/点击干扰
     exitPickAfterSelection();
     showConfirmPanel(selectedEl, e.clientX, e.clientY);
   }
@@ -347,7 +337,7 @@
   function showConfirmPanel(el, x, y) {
     removeElement(confirmPanel);
     confirmPanel = document.createElement('div');
-    confirmPanel.dataset.lock = '1'; // 用于标识不可选
+    confirmPanel.dataset.lock = '1';
     Object.assign(confirmPanel.style, {
       position: 'fixed',
       zIndex: 100001,
@@ -363,7 +353,9 @@
     });
 
     const container = ensureAnswerContainer(el);
-    const { questionPreview, answerPreview } = buildPreview(container);
+    // 使用增强后的逻辑生成预览
+    const questionForPreview = maybeEnhanceQuestion(extractQuestion(container));
+    const { questionPreview, answerPreview } = buildPreviewWithGivenQuestion(container, questionForPreview);
 
     confirmPanel.innerHTML = `
       <div style="font-weight:600;margin-bottom:6px;">确认选择该元素？</div>
@@ -393,13 +385,11 @@
     confirmPanel.querySelector('#__confirm_pick__').addEventListener('click', () => {
       const targetContainer = ensureAnswerContainer(selectedEl || el);
       const selector = buildUniqueSelector(targetContainer);
-      // 完整清理（移除红框和确认面板）
       stopVisualPick(true);
       processContainer(targetContainer, selector);
     });
 
     confirmPanel.querySelector('#__cancel_pick__').addEventListener('click', () => {
-      // 取消：清理红框与确认面板，不执行提取
       stopVisualPick(true);
     });
   }
@@ -416,7 +406,7 @@
     `;
   }
 
-  /******************** 选择容器辅助 ********************/
+  /******************** 容器辅助 ********************/
   function findBestContainer(el) {
     if (!el) return null;
     return el.closest('.ContentItem') ||
@@ -437,9 +427,8 @@
     return el;
   }
 
-  function buildPreview(container) {
-    let questionText = extractQuestion(container);
-    if (!questionText) questionText = '(未解析)';
+  function buildPreviewWithGivenQuestion(container, questionText) {
+    let questionPreview = (questionText || '(未解析)').slice(0, 50);
     const answerNode = findAnswerNode(container);
     let answerPreview = '';
     if (answerNode) {
@@ -447,13 +436,10 @@
     } else {
       answerPreview = '(未找到回答节点)';
     }
-    return {
-      questionPreview: questionText.slice(0, 50),
-      answerPreview
-    };
+    return { questionPreview, answerPreview };
   }
 
-  /******************** 处理提取 & 清洗 ********************/
+  /******************** 提取与清洗 ********************/
   function processContainer(container, selectorUsed) {
     try {
       const { questionText, answerNode } = extractRaw(container);
@@ -479,7 +465,8 @@
   }
 
   function extractRaw(container) {
-    const questionText = extractQuestion(container) || '(未能解析出问题文本)';
+    let questionText = extractQuestion(container);
+    questionText = maybeEnhanceQuestion(questionText) || '(未能解析出问题文本)';
     const answerNode = findAnswerNode(container);
     if (!answerNode) throw new Error('未找到回答内容节点 (RichText)');
     return { questionText, answerNode };
@@ -498,7 +485,7 @@
       const h2 = container.querySelector('h2');
       if (h2) questionText = h2.textContent.trim();
     }
-    return questionText.trim();
+    return (questionText || '').trim();
   }
 
   function findAnswerNode(container) {
@@ -506,6 +493,21 @@
            container.querySelector('.RichContent .RichText[itemprop="text"]') ||
            container.querySelector('.RichContent .RichText') ||
            container.querySelector('[itemprop="text"]');
+  }
+
+  // 新增：若局部问题不含问号，则回退到全局 <h1 class="QuestionHeader-title">
+  function maybeEnhanceQuestion(questionText) {
+    const text = (questionText || '').trim();
+    if (text && /[?？]/.test(text)) {
+      return text;
+    }
+    // 回退查找全局问题标题
+    const globalH1 = document.querySelector('h1.QuestionHeader-title');
+    if (globalH1) {
+      const gText = globalH1.textContent.trim();
+      if (gText) return gText;
+    }
+    return text; // 原样返回（可能为空或仍不含问号）
   }
 
   function isNonSemanticParagraph(p) {
@@ -550,7 +552,7 @@
     return { cleanedParagraphs, cleanedText, removedCount, totalCount };
   }
 
-  /******************** 输出/复制/导出 ********************/
+  /******************** 输出 / 导出 / 复制 ********************/
   function handleOutputs(data) {
     const {
       selector,
@@ -577,11 +579,8 @@
     const plainCopy = `问题：${questionText}\n回答：${cleanedText}`;
 
     if (exportJSONEnabled) {
-      try {
-        exportJSONFile(jsonStr, questionText);
-      } catch (e) {
-        console.error('导出 JSON 失败：', e);
-      }
+      try { exportJSONFile(jsonStr, questionText); }
+      catch (e) { console.error('导出 JSON 失败：', e); }
     }
 
     if (autoCopyEnabled) {
@@ -655,7 +654,7 @@
     });
   }
 
-  /******************** CSS 选择器生成 ********************/
+  /******************** 选择器生成 ********************/
   function buildUniqueSelector(el) {
     if (!el || el === document || el === document.documentElement) return 'html';
     if (el.id) {
@@ -667,7 +666,6 @@
     let cur = el;
     while (cur && cur.nodeType === 1 && cur !== document.body && cur !== document.documentElement) {
       let segment = cur.nodeName.toLowerCase();
-
       const classList = Array.from(cur.classList || []);
       const stableClass = classList.find(c => !/^\d+$/.test(c) && c.length > 1 && !/[A-Z]/.test(c));
       if (stableClass) {
@@ -693,7 +691,6 @@
         break;
       }
     }
-
     const full = pathSegments.join(' > ');
     return full || 'body';
   }
@@ -715,12 +712,8 @@
   }
 
   function setPersist(key, val) {
-    try {
-      if (typeof GM_setValue === 'function') GM_setValue(key, val);
-    } catch {}
-    try {
-      localStorage.setItem(key, val ? 'true' : 'false');
-    } catch {}
+    try { if (typeof GM_setValue === 'function') GM_setValue(key, val); } catch {}
+    try { localStorage.setItem(key, val ? 'true' : 'false'); } catch {}
   }
 
   function removeElement(el) {
